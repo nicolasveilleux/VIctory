@@ -977,6 +977,115 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "run explicitly with VICTORY_LEVELS_ON_DEMAND=0 and =1 on a D3D12 adapter"]
+    fn streamed_bc1_readback_before_and_after_mapping() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let h = host().expect("D3D12 adapter");
+        let enabled = std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1");
+        let copy = Arc::new(crate::resource::test_streamed_bc1());
+        assert_eq!(copy.tiled.is_some(), enabled);
+
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 2048, height: 2048, depth: 1, mips: 12,
+            element_bytes: 8, block: 4, samples: 1, swizzle: Swizzle::SW_64KB_S,
+        }).unwrap();
+        let size = layout.size as usize;
+        let boundary = layout.mips[0].offset as usize;
+        assert!(boundary.is_multiple_of(crate::watch::PAGE) && size > boundary);
+        // SAFETY: reserve a private write-watched pool and commit only the smaller mips.
+        let mem = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | 0x0020_0000, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!mem.is_null());
+        let fill = |offset, len, value| {
+            // SAFETY: both spans are inside the private, page-aligned reservation.
+            unsafe {
+                let first = mem.add(offset);
+                assert_eq!(VirtualAlloc(first.cast(), len, MEM_COMMIT, PAGE_READWRITE), first.cast());
+                first.write_bytes(value, len);
+            }
+        };
+        fill(0, boundary, 0x51);
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 12];
+        let mut rows = vec![0u32; 12];
+        let mut row_bytes = [0u64; 12];
+        let mut total = 0;
+        // SAFETY: outputs have room for the 12 subresources.
+        unsafe {
+            h.device.GetCopyableFootprints(
+                &copy.texture.GetDesc(), 0, 12, 0,
+                Some(footprints.as_mut_ptr()), Some(rows.as_mut_ptr()),
+                Some(row_bytes.as_mut_ptr()), Some(&mut total),
+            );
+        }
+        let tracked = crate::watch::track(mem as usize, size, true).expect("write-watched pool");
+        let staging = Arc::new(Staging {
+            size: total, footprints, rows, spans: spans(&layout, 12, 12), layout,
+            mips: 12, memory: mem, tracked: Some(tracked), last: Mutex::default(),
+            on_demand: enabled.then(|| Arc::downgrade(&copy)),
+            retry: false.into(), pending: 0.into(), uploads: Default::default(), copied: Default::default(),
+        });
+        for full in [false, true] {
+            if full {
+                fill(boundary, size - boundary, 0xa7);
+                crate::watch::title_memory_remapped(mem as usize + boundary, size - boundary);
+            }
+            let upload = h.new_list().unwrap();
+            upload.defer_texture(staging.clone(), copy.clone());
+            upload.close();
+            h.execute(&[&upload]);
+            if let Some(tiled) = &copy.tiled {
+                assert_eq!(tiled.whole(), full);
+                assert_eq!(tiled.without(1), u32::from(!full));
+            }
+            let read = h.new_list().unwrap();
+            let (buffer, ptr) = read.readback(h, total).expect("readback");
+            if let Some(barrier) = read.move_texture(&copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32) {
+                // SAFETY: barrier refers to a live texture on an open list.
+                unsafe { read.list.ResourceBarrier(&[barrier]); }
+            }
+            for (i, &footprint) in staging.footprints.iter().enumerate() {
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    // SAFETY: texture remains live through completion.
+                    pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+                };
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    // SAFETY: readback remains live through completion.
+                    pResource: unsafe { std::mem::transmute_copy(&buffer) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                };
+                // SAFETY: live resources in copy states, valid DXGI footprints.
+                unsafe { read.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None); }
+            }
+            read.close();
+            h.execute(&[&read]);
+            // SAFETY: the queue completed and the readback allocation is mapped for total bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, total as usize) };
+            for (i, &f) in staging.footprints.iter().enumerate() {
+                let expected = if i > 0 { 0x51 } else if full { 0xa7 } else { 0 };
+                for y in 0..staging.rows[i] as usize {
+                    let at = f.Offset as usize + y * f.Footprint.RowPitch as usize;
+                    assert!(
+                        bytes[at..at + row_bytes[i] as usize].iter().all(|&b| b == expected),
+                        "mode={enabled} full={full} mip={i} row={y} expected={expected:#x} first={:#x}",
+                        bytes[at]
+                    );
+                }
+            }
+        }
+        drop((staging, copy));
+        // SAFETY: all trackers and submissions that refer to the private reservation are gone.
+        assert_ne!(unsafe { VirtualFree(mem.cast(), 0, MEM_RELEASE) }, 0);
+    }
+
+
+    #[test]
     fn subresource_len_stays_inside_staging_total() {
         // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
         // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.

@@ -260,6 +260,7 @@ pub(crate) struct Tiled {
     levels: u32,
     /// The bytes all its tiles would take.
     full: u64,
+    mapped_bytes: AtomicU64,
     given: Mutex<Given>,
     /// Every level has tiles: [`Tiled::give`] has nothing left to do.
     whole: AtomicBool,
@@ -330,6 +331,7 @@ impl Tiled {
             packed: packed_tiles,
             levels,
             full,
+            mapped_bytes: AtomicU64::new(0),
             whole: AtomicBool::new(false),
         })
     }
@@ -429,7 +431,9 @@ impl Tiled {
             for &(start, count) in &runs {
                 given.runs.push((index, start, count));
             }
-            STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
+            let bytes = u64::from(tiles) * TILE;
+            self.mapped_bytes.fetch_add(bytes, Ordering::Relaxed);
+            STATS[2].fetch_add(bytes, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
         }
         if !all {
@@ -454,6 +458,12 @@ impl Tiled {
             }
         }
         levels & without
+    }
+
+    /// Bytes assigned to this texture, reusable once it is retired.
+    /// The containing heap need not disappear from DXGI usage.
+    pub(crate) fn mapped_bytes(&self) -> u64 {
+        self.mapped_bytes.load(Ordering::Relaxed)
     }
 
     /// The bytes of the tiles it has now.
@@ -622,6 +632,7 @@ mod tests {
         assert!(tiled.whole());
         assert_eq!(tiled.without(0xfff), 0);
         assert_eq!(tiled.given_bytes(), tiled.full);
+        assert_eq!(tiled.mapped_bytes(), tiled.given_bytes());
         // The mappings above are queued, not done: an empty submission waits
         // for them before the heaps go back (in the title, the list that
         // used the texture holds it past them).

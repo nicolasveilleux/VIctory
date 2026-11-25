@@ -834,6 +834,12 @@ pub(crate) struct HostTexture {
 
 #[cfg(windows)]
 impl HostTexture {
+    /// Bytes that can be reused once the allocation retires, not an
+    /// immediate reduction in DXGI usage for a shared heap.
+    fn eviction_bytes(&self) -> u64 {
+        self.tiled.as_ref().map_or(self.bytes, crate::tiles::Tiled::mapped_bytes)
+    }
+
     /// A host texture made outside the title's resources (twins).
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -1536,6 +1542,18 @@ fn reserved_texture(host: &crate::host::Host, d: &ResourceDesc, castable: &[u32]
     Some(HostTexture::tiled(texture, state, castable.to_vec(), tiled))
 }
 
+
+#[cfg(test)]
+pub(crate) fn test_streamed_bc1() -> HostTexture {
+    let desc = ResourceDesc {
+        dimension: 3, alignment: 0, width: 2048, height: 2048,
+        depth_or_array_size: 1, mip_levels: 12, format: 71, sample_count: 1,
+        sample_quality: 0, layout: 0, flags: 0,
+    };
+    make_texture(&desc, 0, std::ptr::null(), true).expect("synthetic BC1 texture")
+}
+
+
 /// A texture's console memory and description; `None` for buffers.
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
@@ -1736,7 +1754,7 @@ pub(crate) fn evict_among(
         }
     }
     let uses: Vec<(u64, u64, u64)> =
-        candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.bytes)).collect();
+        candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.eviction_bytes())).collect();
     let chosen = choose(&uses, frame, now, over);
     let gone: Vec<Owned> = chosen.into_iter().map(|i| candidates[i].clone()).collect();
     give_up(&gone, frame)
@@ -1769,6 +1787,10 @@ fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usiz
         if over == 0 {
             break;
         }
+        // With no backing allocation, an eviction cannot relieve pressure.
+        if uses[i].2 == 0 {
+            continue;
+        }
         over = over.saturating_sub(uses[i].2);
         gone.push(i);
     }
@@ -1799,7 +1821,7 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
     let given = given.get_or_insert_with(Default::default);
     given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
-    let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
+    let bytes = gone.iter().map(|(t, _)| t.eviction_bytes()).sum();
     for (t, owners) in gone {
         for &r in owners.iter().filter(|r| live.contains(r)) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
@@ -2388,6 +2410,79 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "isolated DXGI allocation measurement; run explicitly in a fresh process"]
+    fn vram_sample_for_streamed_bc1_chains() {
+        let host = crate::host::host().expect("D3D12 adapter");
+        let enabled = std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1");
+        let full = std::env::var_os("VICTORY_VRAM_SAMPLE").is_some_and(|v| v == "full");
+        const COUNT: usize = 192;
+        const MASK: u32 = 0xfff;
+        let measure = || {
+            host.execute(&[]);
+            // Check after DXGI has had time to refresh the per-process usage.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            crate::host::video_memory().expect("DXGI usage and budget")
+        };
+        let [(local_before, budget), (nonlocal_before, _)] = measure();
+        let mut textures = Vec::with_capacity(COUNT);
+        let mut full_bytes = 0;
+        let levels = if full { MASK } else { MASK & !3 };
+        for _ in 0..COUNT {
+            let t = test_streamed_bc1();
+            assert_eq!(t.tiled.is_some(), enabled, "no fallback may be counted as tiled");
+            if let Some(tiled) = &t.tiled {
+                assert_eq!(tiled.without(MASK), MASK);
+                assert!(tiled.give(&t.texture, levels));
+                assert_eq!(tiled.without(levels), 0);
+                assert_eq!(tiled.whole(), full);
+                if !full {
+                    assert_eq!(tiled.without(3), 3);
+                }
+            } else {
+                full_bytes += t.bytes;
+            }
+            textures.push(t);
+        }
+        let [(local_after, _), (nonlocal_after, _)] = measure();
+        crate::tiles::status();
+        println!(
+            "VRAM_SAMPLE enabled={enabled} full={full} textures={COUNT} whole_bytes={full_bytes} local_before_mb={local_before:.3} local_after_mb={local_after:.3} local_delta_mb={:.3} nonlocal_delta_mb={:.3} budget_mb={budget:.3}",
+            local_after - local_before,
+            nonlocal_after - nonlocal_before
+        );
+        assert!(local_after > local_before, "local allocation must be visible");
+        drop(textures);
+    }
+
+
+    #[test]
+    #[ignore = "requires a D3D12 adapter with tiled resources tier 2"]
+    fn pressure_credits_mapped_tiles_without_evicting_unbacked_textures() {
+        let host = crate::host::host().expect("D3D12 adapter");
+        assert!(crate::tiles::wanted(), "run with VICTORY_LEVELS_ON_DEMAND=1");
+        let textures: Vec<Owned> = (0..3)
+            .map(|_| (std::sync::Arc::new(test_streamed_bc1()), Vec::new()))
+            .collect();
+        for (i, (texture, _)) in textures.iter().enumerate() {
+            let tiled = texture.tiled.as_ref().expect("reserved texture");
+            if i != 0 {
+                assert!(tiled.give(&texture.texture, 1));
+            }
+            texture.stamp_at(1, 1 + i as u64);
+        }
+        host.execute(&[]);
+        // BC1 2048x2048 mip 0 uses exactly 2 MiB. None is idle yet. The
+        // oldest texture has no tiles and the next one meets the target.
+        let expected_bytes = 2 << 20;
+        let none_read = std::collections::HashSet::new();
+        assert_eq!(
+            evict_among(&textures, &none_read, 2, 5, expected_bytes),
+            (1, expected_bytes)
+        );
+    }
+
 
     #[test]
     fn a_regions_rows_in_a_footprint() {
