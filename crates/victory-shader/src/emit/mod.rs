@@ -338,6 +338,13 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with_resources(container).map(|(shader, _)| shader)
+}
+
+/// Translates one program and returns the descriptor ranges of that same program.
+pub fn translate_with_resources(
+    container: &[u8],
+) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -361,7 +368,8 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    let shader = emit(&c, &native, &p, &st, &io, &res)?;
+    Ok((shader, native.used))
 }
 
 /// Emits a program whose earlier stages already ran.

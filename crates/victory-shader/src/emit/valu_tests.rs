@@ -1298,7 +1298,12 @@ fn fspx_cs(body: &[u32]) -> HostShader {
         &[fspx_resource(3, 3, 0, 0, 4, 1)],
     );
     let container = crate::dxbc::build(&[(crate::FourCC::ACCC, &part)]);
-    super::translate(&container).expect("translate")
+    let (shader, used) = super::translate_with_resources(&container).expect("translate");
+    assert_eq!(used.len(), 1);
+    assert_eq!(used[0].kind, ResourceType::Uav);
+    assert_eq!(used[0].root, crate::RootType::Table);
+    assert_eq!((used[0].user_data, used[0].slot), (4, 1));
+    shader
 }
 
 /// VOP3P `v_dot4_i32_i8 vdst, src0, src1, src2`, `opsel` and `opsel_hi`

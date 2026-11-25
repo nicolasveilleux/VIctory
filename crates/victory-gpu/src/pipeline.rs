@@ -97,12 +97,8 @@ impl Shader {
     }
 }
 
-/// A translated shader and the console resources its code reads.
 #[cfg(windows)]
-pub(crate) struct Translated {
-    pub(crate) host: victory_shader::emit::HostShader,
-    pub(crate) used: Vec<victory_shader::UsedResource>,
-}
+pub(crate) use crate::shader_cache::Translated;
 
 #[cfg(windows)]
 impl Shader {
@@ -112,7 +108,7 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
+                let (done, cached) = crate::shader_cache::translation(&self.container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -164,37 +160,6 @@ fn thread_cpu() -> (u64, u64) {
 fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
     let now = thread_cpu();
     ((now.0 - then.0) / 10_000, (now.1 - then.1) / 10_000)
-}
-
-/// The translation, and whether it came from the cache.
-#[cfg(windows)]
-fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
-    (host.and_then(|host| with_resources(container, host)), cached)
-}
-
-#[cfg(windows)]
-fn with_resources(
-    container: &[u8],
-    host: victory_shader::emit::HostShader,
-) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
-    let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    Ok(Translated { host, used })
 }
 
 #[repr(C)]
