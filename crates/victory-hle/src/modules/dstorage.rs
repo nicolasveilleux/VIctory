@@ -332,12 +332,15 @@ struct Scheduler {
 const COST: [u64; 3] = [100, 10, 1];
 /// The console's default staging buffer.
 const STAGING: u64 = 32 << 20;
+const HDD_LOOKAHEAD: usize = 64;
 
 struct Lanes {
     lanes: HashMap<u64, Lane>,
     next_id: u64,
     /// Submission order over all queues.
     next_seq: u64,
+    /// Prefer increasing file offsets within a bounded set of eligible reads.
+    hdd_locality: bool,
     /// Bytes of staging held by running requests, and the limit.
     staged: u64,
     staging: u64,
@@ -371,6 +374,9 @@ struct Lane {
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Request)>,
+    /// Upper sequence bound for the current locality window; later arrivals
+    /// cannot extend it and delay an older request indefinitely.
+    hdd_window_end: Option<u64>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -405,6 +411,8 @@ fn scheduler() -> Option<&'static Scheduler> {
                     lanes: HashMap::new(),
                     next_id: 0,
                     next_seq: 0,
+                    hdd_locality: std::env::var_os("VICTORY_DSTORAGE_HDD_LOCALITY")
+                        .is_some_and(|v| v == "1"),
                     staged: 0,
                     staging: STAGING,
                     starved: false,
@@ -513,14 +521,27 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        let &(_, head) = lane.reads.front()?;
+        let fits = |r: &Request| self.staged == 0 || self.staged + staging_bytes(r) <= self.staging;
+        if !fits(&head) {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let index = if self.hdd_locality {
+            let candidate = lane.hdd_read_index();
+            if fits(&lane.reads[candidate].1) {
+                candidate
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        // Removing an item keeps all remaining reads in sequence order, so
+        // status completion can still find its oldest pending read at front.
+        let (seq, request) = lane.reads.remove(index)?;
+        let staging = staging_bytes(&request);
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -587,11 +608,51 @@ impl Lane {
             clock: 0,
             unsubmitted: Vec::new(),
             reads: VecDeque::new(),
+            hdd_window_end: None,
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
             closed: false,
         }
+    }
+
+    /// Choose only within a fixed window of same-file reads before a status.
+    /// Do not look beyond memory sources, page lists or destination overlap.
+    fn hdd_read_index(&mut self) -> usize {
+        let Some(&(first, head)) = self.reads.front() else {
+            return 0;
+        };
+        let end = match self.hdd_window_end {
+            Some(end) if end >= first => end,
+            _ => {
+                let mut end = first;
+                let mut ranges = [(0, 0); HDD_LOOKAHEAD];
+                let next_status = self.statuses.iter().find(|(seq, _)| *seq > first);
+                for (i, (seq, request)) in self.reads.iter().take(HDD_LOOKAHEAD).enumerate() {
+                    if request.source != head.source
+                        || next_status.is_some_and(|(status, _)| *seq >= *status)
+                    {
+                        break;
+                    }
+                    let Some((begin, stop)) = file_destination(request) else {
+                        break;
+                    };
+                    if ranges[..i].iter().any(|&(a, b)| begin < b && a < stop) {
+                        break;
+                    }
+                    ranges[i] = (begin, stop);
+                    end = *seq;
+                }
+                self.hdd_window_end = Some(end);
+                end
+            }
+        };
+        self.reads
+            .iter()
+            .take_while(|(seq, _)| *seq <= end)
+            .enumerate()
+            .min_by_key(|(_, (seq, request))| (request.offset, *seq))
+            .map_or(0, |(index, _)| index)
     }
 
     /// Requests and status entries held, submitted or not.
@@ -618,6 +679,27 @@ impl Lane {
                 .store(first.unwrap_or(S_OK), Ordering::Release);
         }
     }
+}
+
+/// The linear output range of a valid-shaped file read. Page destinations
+/// name a list, not the actual written ranges, so keep them in FIFO order.
+fn file_destination(request: &Request) -> Option<(usize, usize)> {
+    if request.options & !(ZLIB | BCPACK) != 0
+        || request.source.is_null()
+        || request.destination.is_null()
+        || request.source_size == 0
+        || request.destination_size == 0
+        || (request.options == 0 && request.source_size > request.destination_size)
+        || request
+            .offset
+            .checked_add(u64::from(request.source_size))
+            .is_none()
+    {
+        return None;
+
+    }
+    let begin = request.destination as usize;
+    Some((begin, begin.checked_add(request.destination_size as usize)?))
 }
 
 /// Staging bytes a request holds while it runs: what it buffers between
@@ -695,7 +777,6 @@ enum Command {
     Read(Request),
     Status(Status),
 }
-
 
 /// A status entry to write, holding a reference on its array.
 struct Status {
@@ -1264,6 +1345,7 @@ mod tests {
             lanes: HashMap::new(),
             next_id: 0,
             next_seq: 0,
+            hdd_locality: false,
             staged: 0,
             staging,
             starved: false,
@@ -1283,6 +1365,145 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         lane.unsubmitted.push(Command::Read(r));
+    }
+
+    #[test]
+    fn hdd_locality_reads_real_bytes_without_completing_a_status_early() {
+        let contents: Vec<u8> = (0..512).map(|i| (i / 16) as u8).collect();
+        let (_dir, file) = file_with(&contents);
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        let mut l = lanes(STAGING);
+        l.hdd_locality = true;
+        let mut lane = Lane::new(0, 64);
+        let mut buffers = [[0u8; 16]; 4];
+        for (offset, buffer) in [96, 32, 64].into_iter().zip(&mut buffers[..3]) {
+            lane.unsubmitted.push(Command::Read(request(
+                0,
+                buffer.as_mut_ptr().cast(),
+                16,
+                file,
+                offset,
+                16,
+            )));
+        }
+        let status = Status { array, index: 0 };
+        add_ref_instance(array);
+        status.entry().store(E_PENDING, Ordering::Release);
+        lane.unsubmitted.push(Command::Status(status));
+        lane.unsubmitted.push(Command::Read(request(
+            0,
+            buffers[3].as_mut_ptr().cast(),
+            16,
+            file,
+            0,
+            16,
+        )));
+        l.lanes.insert(0, lane);
+        l.submit(0);
+        for (index, offset) in [32, 64, 96, 0].into_iter().enumerate() {
+            let job = l.start().unwrap();
+            assert_eq!(job.request.offset, offset);
+            let outcome = execute(&job.request);
+            assert_eq!(outcome, Ok(()));
+            l.finish(&job, outcome);
+            assert_eq!(
+                result(array.cast(), 0),
+                if index < 2 { E_PENDING } else { S_OK }
+            );
+        }
+        for (offset, buffer) in [96, 32, 64, 0].into_iter().zip(buffers) {
+            assert_eq!(&buffer[..], &contents[offset..offset + 16]);
+        }
+    }
+
+    #[test]
+    fn hdd_locality_windows_cannot_grow_or_cross_an_overlap() {
+        let mut l = lanes(STAGING);
+        l.hdd_locality = true;
+        let mut lane = Lane::new(0, 256);
+        let file = std::ptr::dangling::<c_void>();
+        let mut buffers = [[0u8; 16]; HDD_LOOKAHEAD + 2];
+        for (i, buf) in buffers.iter_mut().take(HDD_LOOKAHEAD).enumerate() {
+            let offset = (HDD_LOOKAHEAD - i) as u64 * 16;
+            lane.unsubmitted.push(Command::Read(request(
+                0,
+                buf.as_mut_ptr().cast(),
+                16,
+                file,
+                offset,
+                16,
+            )));
+        }
+        l.lanes.insert(0, lane);
+        l.submit(0);
+        let first = l.start().unwrap();
+        assert_eq!(first.request.offset, 16);
+        l.finish(&first, Ok(()));
+        let lane = l.lanes.get_mut(&0).unwrap();
+        let extra = buffers[HDD_LOOKAHEAD].as_mut_ptr().cast();
+        lane.unsubmitted
+            .push(Command::Read(request(0, extra, 16, file, 8, 16)));
+        lane.unsubmitted
+            .push(Command::Read(request(0, extra, 16, file, 0, 16)));
+        l.submit(0);
+        for offset in (2..=HDD_LOOKAHEAD).map(|i| i as u64 * 16).chain([8, 0]) {
+            let job = l.start().unwrap();
+            assert_eq!(job.request.offset, offset);
+            l.finish(&job, Ok(()));
+        }
+        assert!(l.start().is_none());
+    }
+
+    #[test]
+    fn hdd_locality_keeps_the_weighted_lane_and_staging_rules() {
+        let mut l = lanes(100);
+        l.hdd_locality = true;
+        l.staged = 60;
+        let file = std::ptr::dangling::<c_void>();
+        let mut buffers = [[0u8; 16]; 4];
+        let mut chosen = Lane::new(0, 64);
+        chosen.unsubmitted.push(Command::Read(request(
+            ZLIB,
+            buffers[0].as_mut_ptr().cast(),
+            16,
+            file,
+            100,
+            30,
+        )));
+        chosen.unsubmitted.push(Command::Read(request(
+            ZLIB,
+            buffers[1].as_mut_ptr().cast(),
+            16,
+            file,
+            0,
+            60,
+        )));
+        let mut other = Lane::new(0, 64);
+        other.clock = 1;
+        other.unsubmitted.push(Command::Read(request(
+            0,
+            buffers[2].as_mut_ptr().cast(),
+            16,
+            file,
+            0,
+            16,
+        )));
+        l.lanes.insert(0, chosen);
+        l.lanes.insert(1, other);
+        l.submit(0);
+        l.submit(1);
+        // The lower offset does not fit, so use the chosen queue's head.
+        let first = l.start().unwrap();
+        assert_eq!((first.lane, first.request.offset, l.staged), (0, 100, 90));
+        l.finish(&first, Ok(()));
+        // Charging the first request's bytes lets the other lane run next.
+        let second = l.start().unwrap();
+        assert_eq!(second.lane, 1);
+        l.finish(&second, Ok(()));
+        assert!(l.start().is_none());
+        l.staged = 0;
+        let third = l.start().unwrap();
+        assert_eq!((third.lane, third.request.offset, l.staged), (0, 0, 60));
     }
 
     #[test]

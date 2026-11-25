@@ -83,6 +83,12 @@ compiles none of those either; the library belongs to the GPU and driver it
 was made on. Run again, it skips what is there in seconds; stopped
 early, it keeps what it made.
 
+Experimental HDD loading: set `VICTORY_DSTORAGE_HDD_LOCALITY=1` before
+launch to schedule nearby file reads together. This is off by default.
+The scheduler keeps queue priorities and does not reorder across status
+markers, other files, or overlapping output buffers. Loading gains depend
+on the drive and workload; leave it off on SSDs unless measuring.
+
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
