@@ -31,6 +31,22 @@ enum Seen {
     Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] (usize, u64, u64)),
 }
 
+impl Seen {
+    /// Whether these slots contribute the same entry to the upload index.
+    /// This does not decide whether the D3D12 descriptor itself is rewritten.
+    fn same_tracking(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Buffer(a, start_a, len_a, uav_a), Self::Buffer(b, start_b, len_b, uav_b)) => {
+                Arc::ptr_eq(a, b) && (start_a, len_a, uav_a) == (start_b, len_b, uav_b)
+            }
+            (Self::Texture(a), Self::Texture(b)) => a == b,
+            (Self::Left(a), Self::Left(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+
 /// Kinds of views left without a host view, for the census.
 #[cfg(feature = "diagnostics")]
 const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other"];
@@ -79,6 +95,21 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
+    fn replace_slot(&mut self, index: u32, seen: Option<Seen>) {
+        if let Some(old) = self.slots.remove(&index) {
+            if seen.as_ref().is_some_and(|next| old.same_tracking(next)) {
+                self.slots.insert(index, old);
+                return;
+            }
+            self.count(&old, false);
+        }
+        if let Some(seen) = seen {
+            self.count(&seen, true);
+            self.slots.insert(index, seen);
+        }
+    }
+
+
     fn count(&mut self, seen: &Seen, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
@@ -132,13 +163,7 @@ impl Viewed {
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = inner.slots.remove(&index) {
-            inner.count(&old, false);
-        }
-        if let Some(seen) = seen {
-            inner.count(&seen, true);
-            inner.slots.insert(index, seen);
-        }
+        inner.replace_slot(index, seen);
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
@@ -541,6 +566,106 @@ void main(uint3 id : SV_DispatchThreadID) {
         out
     }
 
+    fn original_replace(inner: &mut Inner, index: u32, seen: Option<Seen>) {
+        if let Some(old) = inner.slots.remove(&index) {
+            inner.count(&old, false);
+        }
+        if let Some(seen) = seen {
+            inner.count(&seen, true);
+            inner.slots.insert(index, seen);
+        }
+    }
+
+    #[test]
+    fn slot_tracking_matches_remove_and_reinsert() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let data = vec![0u8; 8192];
+        let addr = data.as_ptr() as u64;
+        crate::shadow::register(addr as usize, addr, 8192);
+        let copy = crate::shadow::find(addr, 8192).expect("synthetic buffer");
+        let buf = |at, len, uav| Some(Seen::Buffer(copy.clone(), addr + at, len, uav));
+        let mut old = Inner::default();
+        let mut new = Inner::default();
+        for (i, value) in [
+            (0, buf(32, 32, false)),
+            (0, buf(32, 32, false)),
+            (1, buf(32, 32, false)),
+            (1, buf(32, 32, true)),
+            (2, buf(1024, 32, false)),
+            (2, None),
+            (0, buf(32, 64, false)),
+            (0, Some(Seen::Texture(3))),
+            (0, Some(Seen::Texture(3))),
+            (2, Some(Seen::Left((2, 16, 1024)))),
+            (2, Some(Seen::Left((2, 16, 2048)))),
+            (0, None), (1, None), (2, None),
+        ] {
+            original_replace(&mut old, i, value.clone());
+            new.replace_slot(i, value);
+            assert_eq!(old.slots.len(), new.slots.len());
+            assert!(old.slots.iter().all(|(i, old)| old.same_tracking(&new.slots[i])));
+            assert_eq!(old.textures, new.textures);
+            assert_eq!(old.ranges.len(), new.ranges.len());
+            assert!(old.ranges.iter().all(|(k, (count, _))| *count == new.ranges[k].0));
+            assert_eq!(old.ends.len(), new.ends.len());
+            assert!(old.ends.iter().all(|(k, (_, starts, ends))| {
+                let (_, new_starts, new_ends) = &new.ends[k];
+                starts == new_starts && ends == new_ends
+            }));
+            assert_eq!(old.hulls.len(), new.hulls.len());
+            assert!(old.hulls.iter().all(|(k, (copy, a, len, uav, bit))| {
+                let (new_copy, new_a, new_len, new_uav, new_bit) = &new.hulls[k];
+                Arc::ptr_eq(copy, new_copy) && (a, len, uav, bit) == (new_a, new_len, new_uav, new_bit)
+            }));
+        }
+        crate::shadow::unregister(addr as usize, addr);
+    }
+
+    #[test]
+    #[ignore = "paired timing of synthetic slot bookkeeping; run explicitly in release"]
+    fn descriptor_rewrite_bookkeeping_ab() {
+        assert!(crate::host::host().is_some());
+        const SLOTS: usize = 25_000;
+        let data = vec![0u8; SLOTS * 64];
+        let addr = data.as_ptr() as u64;
+        crate::shadow::register(addr as usize, addr, data.len() as u64);
+        let copy = crate::shadow::find(addr, data.len() as u64).expect("synthetic buffer");
+        type Replace = fn(&mut Inner, u32, Option<Seen>);
+        fn measure(replace: Replace, copy: &Arc<Shadow>, addr: u64, changes_every: usize) -> f64 {
+            let mut index = Inner::default();
+            for slot in 0..SLOTS {
+                index.replace_slot(slot as u32, Some(Seen::Buffer(copy.clone(), addr + slot as u64 * 64, 32, false)));
+            }
+            let begin = std::time::Instant::now();
+            for round in 0..4 {
+                for slot in 0..SLOTS {
+                    let change = changes_every != 0 && slot % changes_every == 0 && round % 2 == 0;
+                    let from = addr + slot as u64 * 64 + u64::from(change) * 8;
+                    let value = Some(Seen::Buffer(copy.clone(), from, 32, false));
+                    (std::hint::black_box(replace))(&mut index, slot as u32, std::hint::black_box(value));
+                }
+            }
+            std::hint::black_box(&index);
+            begin.elapsed().as_secs_f64() * 1e3
+        }
+        for changes_every in [0, 5, 1] {
+            for pair in 0..10 {
+                let modes = if pair % 2 == 0 { [false, true] } else { [true, false] };
+                for fast in modes {
+                    let replace = if fast { Inner::replace_slot } else { original_replace };
+                    let ms = measure(replace, &copy, addr, changes_every);
+                    if pair >= 2 {
+                        println!("REWRITE_AB,{changes_every},{pair},{fast},{ms:.4}");
+                    }
+                }
+            }
+        }
+        crate::shadow::unregister(addr as usize, addr);
+    }
+
+
     const LINEAR: u32 = 0x100;
 
     /// A copy's hull is its live ranges' first start to last end, kept as
@@ -679,6 +804,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
             list.defer_heap(&heap_host.viewed);
             list.close();
+            // Rewrite the same descriptors while their contents change.
+            crate::descriptor::create_srv(null, src, &srv, slot(0));
+            crate::descriptor::create_srv(null, tex, std::ptr::null(), slot(2));
             // The title writes after recording, before submitting.
             write(base, texel);
             host.execute(&[&list]);
