@@ -64,3 +64,9 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# Keep source lines in backtraces without emitting full local-variable debug
+# information on each edit. The ordinary dev, test and release profiles stay unchanged.
+[profile.iter]
+inherits = "dev"
+debug = "line-tables-only"

@@ -212,6 +212,21 @@ To compare hardware and software rendering, repeat with
 created. Compare the exception's module and offset, stack frames, and
 preceding messages across the two runs.
 
+## Faster local Rust iterations
+
+Pass `--profile iter` for a local build or focused test run that keeps file and
+line numbers in backtraces, but omits full debugger information for variables.
+It has its own target directory; keep using the same profile between edits
+to reuse its incremental cache.
+
+```powershell
+cargo test --locked --profile iter -p victory-gpu --lib texture::tests
+cargo build --locked --profile iter -p victory --features diagnostics
+```
+
+Use the normal test profile for CI and the existing release/diag profiles
+for runtime performance comparisons.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
